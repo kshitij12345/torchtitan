@@ -16,6 +16,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 
 from torchtitan.protocols.module import Module
+from torchtitan.tools.logging import logger
 
 from .token_dispatcher import LocalTokenDispatcher
 
@@ -73,6 +74,136 @@ def _run_experts_grouped_mm(
     return out
 
 
+def _run_experts_chunked_while_loop(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    chunk_size: int,
+    use_grouped_mm: bool,
+) -> torch.Tensor:
+    """Process expert-sorted tokens in fixed-size chunks.
+
+    Splits the pre-sorted token stream into chunks of ``chunk_size``, runs
+    the expert computation on each chunk, and assembles the result.
+    Fixed chunk shapes enable CUDA graph capture and torch.compile graphability.
+
+    Uses ``torch.while_loop`` under ``torch.compile`` for graphability, and a
+    plain Python loop in eager mode.
+
+    The input ``x`` must already be sorted by expert (as produced by
+    ``TokenReorderer`` / EP dispatch).
+    """
+    total_tokens = x.shape[0]
+    dim = x.shape[1]
+    num_experts = num_tokens_per_expert.shape[0]
+
+    if total_tokens == 0:
+        run_experts_fn = (
+            _run_experts_grouped_mm if use_grouped_mm else _run_experts_for_loop
+        )
+        return run_experts_fn(w1, w2, w3, x, num_tokens_per_expert)
+
+    num_chunks = (total_tokens + chunk_size - 1) // chunk_size
+    padded_total = num_chunks * chunk_size
+    pad_count = padded_total - total_tokens
+
+    if pad_count > 0:
+        x_padded = F.pad(x, (0, 0, 0, pad_count))
+    else:
+        x_padded = x
+
+    expert_ids = torch.arange(
+        num_experts, device=x.device, dtype=torch.long
+    ).repeat_interleave(num_tokens_per_expert.long())
+
+    if pad_count > 0:
+        pad_ids = torch.full(
+            (pad_count,), num_experts, device=x.device, dtype=torch.long
+        )
+        expert_ids_padded = torch.cat([expert_ids, pad_ids])
+    else:
+        expert_ids_padded = expert_ids
+
+    num_bins = num_experts + 1
+    num_bins_float = float(num_bins)
+    chunk_arange = torch.arange(chunk_size, device=x.device, dtype=torch.long)
+
+    def _process_chunk(
+        chunk_idx: int | torch.Tensor,
+        y_padded: torch.Tensor,
+    ) -> torch.Tensor:
+        start = chunk_idx * chunk_size
+        indices = start + chunk_arange
+
+        chunk_x = x_padded[indices]
+        chunk_expert_ids = expert_ids_padded[indices]
+
+        chunk_num_tokens_with_pad = torch.histc(
+            chunk_expert_ids.float(),
+            bins=num_bins,
+            min=0,
+            max=num_bins_float,
+        )
+        chunk_num_tokens = chunk_num_tokens_with_pad[:num_experts].to(
+            dtype=num_tokens_per_expert.dtype
+        )
+
+        chunk_out = _run_experts_grouped_mm(
+            w1, w2, w3, chunk_x, chunk_num_tokens
+        )
+        # grouped_mm produces undefined values for padding rows beyond the
+        # last offset. Zero them out to prevent NaN propagation.
+        is_real = (chunk_expert_ids < num_experts).unsqueeze(-1)
+        chunk_out = torch.where(is_real, chunk_out, torch.zeros_like(chunk_out))
+
+        return y_padded.scatter(
+            0,
+            indices.unsqueeze(-1).expand(-1, dim),
+            chunk_out,
+        )
+
+    # torch.while_loop for compile (graphability), Python for-loop for eager.
+    # In eager mode, torch.while_loop's WhileLoopAutogradOp backward uses
+    # while_loop_stack_output which is incompatible with activation
+    # checkpointing's _CachingTorchDispatchMode.
+    if torch.compiler.is_compiling():
+        num_chunks_tensor = torch.tensor(
+            num_chunks, device=x.device, dtype=torch.long
+        )
+
+        def cond_fn(
+            chunk_idx: torch.Tensor, y_padded: torch.Tensor
+        ) -> torch.Tensor:
+            return chunk_idx < num_chunks_tensor
+
+        def body_fn(
+            chunk_idx: torch.Tensor, y_padded: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            y_padded = _process_chunk(chunk_idx, y_padded)
+            return chunk_idx + 1, y_padded
+
+        _, y_padded = torch.while_loop(
+            cond_fn,
+            body_fn,
+            (
+                torch.tensor(0, device=x.device, dtype=torch.long),
+                torch.zeros(
+                    padded_total, dim, device=x.device, dtype=x.dtype
+                ),
+            ),
+        )
+    else:
+        y_padded = torch.zeros(
+            padded_total, dim, device=x.device, dtype=x.dtype
+        )
+        for i in range(num_chunks):
+            y_padded = _process_chunk(i, y_padded)
+
+    return y_padded[:total_tokens]
+
+
 class GroupedExperts(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -80,6 +211,7 @@ class GroupedExperts(Module):
         hidden_dim: int
         num_experts: int
         use_grouped_mm: bool = True
+        while_loop_chunk_size: int | None = None
         token_dispatcher: LocalTokenDispatcher.Config
 
     def __init__(self, config: Config):
@@ -95,6 +227,7 @@ class GroupedExperts(Module):
             torch.empty(config.num_experts, config.hidden_dim, config.dim)
         )
         self.use_grouped_mm = config.use_grouped_mm
+        self.while_loop_chunk_size = config.while_loop_chunk_size
         self.token_dispatcher = config.token_dispatcher.build()
 
     def _experts_forward(
@@ -116,7 +249,12 @@ class GroupedExperts(Module):
             w2 = self.w2
             w3 = self.w3
 
-        if self.use_grouped_mm:
+        if self.while_loop_chunk_size is not None:
+            return _run_experts_chunked_while_loop(
+                w1, w2, w3, x, num_tokens_per_expert,
+                self.while_loop_chunk_size, self.use_grouped_mm,
+            )
+        elif self.use_grouped_mm:
             return _run_experts_grouped_mm(w1, w2, w3, x, num_tokens_per_expert)
         else:
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)

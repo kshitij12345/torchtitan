@@ -170,6 +170,7 @@ def _build_dsv3_layers(
     router_route_scale: float = 1.0,
     router_route_norm: bool = False,
     score_before_experts: bool = False,
+    while_loop_chunk_size: int | None = None,
     attn_backend: str,
     moe_comm_backend: str | None = None,
     non_blocking_capacity_factor: float | None = None,
@@ -226,6 +227,7 @@ def _build_dsv3_layers(
                     num_experts=num_experts,
                     top_k=router_top_k,
                     param_init=_depth_experts_init(layer_id),
+                    while_loop_chunk_size=while_loop_chunk_size,
                     score_before_experts=score_before_experts,
                     comm_backend=moe_comm_backend,
                     non_blocking_capacity_factor=non_blocking_capacity_factor,
@@ -283,6 +285,70 @@ def _debugmodel(
         num_experts=num_experts,
         num_shared_experts=num_shared_experts,
         router_top_k=3,
+        router_score_func="softmax",
+        score_before_experts=False,
+        attn_backend=attn_backend,
+        moe_comm_backend=moe_comm_backend,
+    )
+    return DeepSeekV3Model.Config(
+        vocab_size=vocab_size,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        output=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        rope=RoPE.Config(
+            dim=rope_dim,
+            max_seq_len=4096 * 4,
+            theta=10000.0,
+            backend="complex",
+            scaling="yarn",
+            rope_factor=40.0,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            original_seq_len=4096,
+        ),
+        layers=layers,
+    )
+
+
+def _16b_4layer(
+    attn_backend: str = "sdpa",
+    moe_comm_backend: str | None = None,
+) -> DeepSeekV3Model.Config:
+    """4-layer variant of 16B for quick EP experiments on small GPU counts."""
+    dim = 2048
+    n_layers = 4
+    vocab_size = 2048
+    n_heads = 16
+    moe_hidden_dim = 1408
+    num_shared_experts = 2
+    dense_hidden_dim = 10944
+    rope_dim = 64
+    num_experts = 64
+    n_dense_layers = 1
+
+    layers = _build_dsv3_layers(
+        n_layers=n_layers,
+        n_dense_layers=n_dense_layers,
+        dim=dim,
+        n_heads=n_heads,
+        q_lora_rank=0,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=128,
+        mscale=0.70,
+        dense_hidden_dim=dense_hidden_dim,
+        moe_hidden_dim=moe_hidden_dim,
+        num_experts=num_experts,
+        num_shared_experts=num_shared_experts,
+        router_top_k=6,
         router_score_func="softmax",
         score_before_experts=False,
         attn_backend=attn_backend,
@@ -515,6 +581,7 @@ def _671b(
 
 deepseekv3_configs = {
     "debugmodel": _debugmodel,
+    "16B_4layer": _16b_4layer,
     "16B": _16b,
     "236B": _236b,
     "671B": _671b,

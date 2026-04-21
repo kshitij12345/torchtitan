@@ -254,6 +254,16 @@ class ParallelismConfig:
     - HYBRIDEP_NUM_SMS_COMBINE (default: 16)
     """
 
+    while_loop_chunk_size: int | None = None
+    """Chunk size for while_loop-based chunked expert processing in MoE.
+
+    When set, expert-sorted tokens are processed in fixed-size chunks,
+    enabling torch.compile graphability and CUDA graph capture. Uses
+    torch.while_loop under torch.compile, and a Python loop in eager mode.
+    None means disabled (default: standard grouped_mm on all tokens at once).
+    No effect for non-MoE models.
+    """
+
 
 @dataclass(kw_only=True, slots=True)
 class ActivationCheckpointConfig:

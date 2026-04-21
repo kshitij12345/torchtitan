@@ -220,6 +220,10 @@ class DeepSeekV3Model(Decoder):
                             "Failed to use grouped mm, which is only supported on SM90 or later",
                         )
                         layer_cfg.moe.experts.use_grouped_mm = False
+                    if parallelism.while_loop_chunk_size is not None:
+                        layer_cfg.moe.experts.while_loop_chunk_size = (
+                            parallelism.while_loop_chunk_size
+                        )
                     layer_cfg.moe.router._debug_force_load_balance = (
                         debug.moe_force_load_balance
                     )

@@ -77,6 +77,39 @@ def deepseek_v3_debugmodel_flex_attn_ep() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_16b_4layer() -> Trainer.Config:
+    return Trainer.Config(
+        hf_assets_path="./tests/assets/tokenizer",
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model_spec=model_registry("16B_4layer"),
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        optimizer=OptimizersContainer.Config(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=2,
+            seq_len=2048,
+            steps=10,
+        ),
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=2,
+            expert_parallel_degree=2,
+            expert_tensor_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(
+            mode="selective",
+        ),
+    )
+
+
 def deepseek_v3_16b() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path="./assets/hf/deepseek-moe-16b-base",

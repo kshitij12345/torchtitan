@@ -253,6 +253,7 @@ def make_experts_config(
     param_init: dict[str, Callable],
     score_before_experts: bool = True,
     use_grouped_mm: bool = True,
+    while_loop_chunk_size: int | None = None,
     comm_backend: str | None = None,
     non_blocking_capacity_factor: float | None = None,
 ) -> GroupedExperts.Config:
@@ -262,6 +263,7 @@ def make_experts_config(
         hidden_dim=hidden_dim,
         num_experts=num_experts,
         use_grouped_mm=use_grouped_mm,
+        while_loop_chunk_size=while_loop_chunk_size,
         param_init=param_init,
         token_dispatcher=make_token_dispatcher_config(
             num_experts=num_experts,
